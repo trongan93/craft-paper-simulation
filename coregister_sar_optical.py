@@ -2,27 +2,24 @@
 """
 Cross-Modality Co-registration (SAR ↔ Optical) — NGF + affine refinement
 
-Now supports RAW inputs:
+Supports RAW inputs:
 - Sentinel-1: .SAFE OR measurement/*vv*.tiff -> (optional) pyroSAR+SNAP geocode to sigma0, terrain-corrected GeoTIFF
 - Sentinel-2: B08_10m.jp2 -> (optional) GDAL convert to GeoTIFF
 
 Pipeline:
 1) (Optional) S1 preproc with pyroSAR (Calibration -> Terrain Correction) to UTM.
 2) (Optional) S2 JP2 -> GeoTIFF via gdal_translate.
-3) Coarse alignment: reproject SAR & MSI to a *shared*, snapped UTM grid (same CRS, pixel size, and origin).
-4) Fine alignment: NGF-based affine refinement (Huber loss) in a multi-scale pyramid.
+3) Coarse alignment: reproject SAR & MSI to a *shared* UTM grid.
+4) Fine alignment: NGF-based affine refinement (Huber loss) in a pyramid.
 5) QC: RMSE_x, RMSE_y, radial RMSE, median error, CE90; checkerboard overlays.
-6) Outputs: co-registered AOI chip(s), transform params, QC summary.
+6) Outputs: co-registered chip(s), transform params, QC summary.
 
 Dependencies:
-  pip install numpy rasterio shapely scikit-image scipy matplotlib tqdm pyroSAR snapista
-  (and install SNAP 'gpt' + GDAL for JP2 conversion)
-
-Author: you
+  pip install numpy rasterio shapely scikit-image scipy matplotlib tqdm spatialist pyroSAR
+  (Install GDAL system libs; ensure SNAP 'gpt' is on PATH for pyroSAR)
 """
 
 import json
-import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,8 +30,7 @@ import rasterio as rio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 from shapely.geometry import shape, box
-from shapely.ops import unary_union
-from shapely.ops import transform as shp_transform
+from shapely.ops import unary_union, transform as shp_transform
 from skimage.transform import AffineTransform, warp, pyramid_gaussian
 from skimage.feature import ORB, match_descriptors
 from skimage.filters import sobel_h, sobel_v, gaussian
@@ -43,52 +39,49 @@ import matplotlib.pyplot as plt
 
 
 # ----------------------------
-# Optional: pyroSAR geocode helper
+# S1 preprocessing via pyroSAR (SNAP gpt backend)
 # ----------------------------
 def s1_preprocess_with_pyrosar(safe_or_meas: str,
                                out_dir: Path,
                                target_epsg: str,
                                target_res_m: float = 10.0,
                                pol: str = "VV",
-                               dem_type: str = "COPERNICUS_30m") -> Path:
+                               dem_name: str = "Copernicus 30m Global DEM") -> Path:
     """
-    Use pyroSAR to call SNAP 'geocode' (Calibration -> Terrain Correction).
-    Returns path to the produced GeoTIFF (sigma0, terrain-corrected).
+    Use pyroSAR to run SNAP 'geocode' (Calibration -> Terrain Correction).
+    Returns the path to the produced GeoTIFF (sigma0, terrain-corrected).
     """
     try:
         from pyroSAR.snap import geocode
     except Exception as e:
         raise RuntimeError(
-            "pyroSAR not available. Install with `pip install pyroSAR snapista` and ensure SNAP 'gpt' is on PATH."
+            "pyroSAR not importable. Ensure 'pyroSAR' & 'spatialist' are installed and GDAL Python works."
         ) from e
 
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # pyroSAR 0.30.1 signature: spacing, t_srs, polarizations, refarea, scaling, demName, export_extra
     geocode(
         infile=str(safe_or_meas),
         outdir=str(out_dir),
-        tr=target_res_m,
-        t_srs=target_epsg,
-        scaling='sigma0',
-        polarizations=[pol],
-        demType=dem_type,
-        export_extra=['INCIDENCE_ANGLE'],
-        nodataValue=0
+        spacing=target_res_m,          # pixel spacing [m]
+        t_srs=target_epsg,             # e.g., "EPSG:32651"
+        polarizations=[pol],           # e.g., ["VV"] or ["VH"]
+        refarea="sigma0",              # output reference area
+        scaling="linear",              # "linear" or "dB"
+        demName=dem_name,              # SNAP DEM name, e.g., "Copernicus 30m Global DEM"
+        export_extra=["localIncidenceAngle"],
     )
 
-    # Find the produced GeoTIFF (sigma0, VV)
+    # Find newest GeoTIFF written by geocode()
     cands = sorted(out_dir.glob("*.tif")) + sorted(out_dir.glob("*.tiff"))
     if not cands:
-        raise RuntimeError("pyroSAR geocode completed but no GeoTIFF found in output directory.")
-    # Pick the most recent one
-    tif_path = max(cands, key=lambda p: p.stat().st_mtime)
-    return tif_path
+        raise RuntimeError("pyroSAR geocode finished but no GeoTIFF found in output directory.")
+    return max(cands, key=lambda p: p.stat().st_mtime)
 
 
 def gdal_translate_jp2_to_tif(jp2_path: str, out_tif: Path) -> Path:
-    """
-    Convert Sentinel-2 JP2 (B08_10m.jp2) to GeoTIFF using gdal_translate.
-    Requires GDAL installed.
-    """
+    """Convert Sentinel-2 JP2 (B08_10m.jp2) to GeoTIFF using gdal_translate."""
     out_tif.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "gdal_translate",
@@ -96,14 +89,11 @@ def gdal_translate_jp2_to_tif(jp2_path: str, out_tif: Path) -> Path:
         "-co", "TILED=YES",
         "-co", "BIGTIFF=YES",
         "-co", "COMPRESS=DEFLATE",
-        "-co", "PREDICTOR=2",  # integer predictor for JP2 input; final outputs use float predictor
+        "-co", "PREDICTOR=2",
         jp2_path,
         str(out_tif)
     ]
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        raise RuntimeError("gdal_translate not found. Please install GDAL or provide MSI as GeoTIFF.")
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return out_tif
 
 
@@ -170,8 +160,7 @@ class GeoImage:
 def load_single_band(path: str, band: int = 1) -> GeoImage:
     with rio.open(path) as ds:
         img = ds.read(band, masked=False).astype(np.float32)
-        profile = ds.profile.copy()
-        return GeoImage(img, ds.transform, ds.crs, ds.nodata, profile)
+        return GeoImage(img, ds.transform, ds.crs, ds.nodata, ds.profile.copy())
 
 
 def reproject_to_common_grid(src: GeoImage, dst_crs: rio.crs.CRS, res: float,
@@ -210,7 +199,7 @@ def reproject_to_common_grid(src: GeoImage, dst_crs: rio.crs.CRS, res: float,
 
 def crop_to_bounds(img: GeoImage, bounds: Tuple[float, float, float, float]) -> GeoImage:
     """
-    Crop using world bounds. Note: the inverse affine returns (col, row).
+    Crop using world bounds. Note: inverse affine returns (col, row).
     """
     left, bottom, right, top = bounds
     col_min, row_min = (~img.transform) * (left,  top)
@@ -227,7 +216,7 @@ def crop_to_bounds(img: GeoImage, bounds: Tuple[float, float, float, float]) -> 
 
 
 # ----------------------------
-# NGF + Affine refinement (Fine)
+# NGF + Affine refinement
 # ----------------------------
 def compute_ngf(image: np.ndarray, eps: float = 1e-3, sigma: float = 1.0) -> np.ndarray:
     img = gaussian(image, sigma=sigma, preserve_range=True) if sigma > 0 else image
@@ -260,13 +249,13 @@ def ngf_cost(p, fix_ngf: np.ndarray, mov_img: np.ndarray, output_shape, eps=1e-3
 def refine_affine_ngf(fix_img: np.ndarray, mov_img: np.ndarray, levels: int = 3,
                       init_params=(0, 0, 0, 1, 1, 0)):
     """
-    Multi-scale NGF with Huber loss. Params: (tx, ty, rot_deg, sx, sy, shear_rad)
+    Multi-scale NGF with Huber loss.
+    Params: (tx_px, ty_px, rot_deg, sx, sy, shear_rad)
     """
     fix = to_float32_minmax(fix_img)
     mov = to_float32_minmax(mov_img)
 
     def build_pyr(im):
-        # channel_axis=None avoids deprecated multichannel and works for grayscale
         pyr = list(pyramid_gaussian(im, max_layer=levels-1, downscale=2, channel_axis=None))
         return pyr[::-1]
 
@@ -315,8 +304,8 @@ def orb_matches_xy(imgA: np.ndarray, imgB: np.ndarray, n_keypoints=2000, seed: i
 
 def residual_metrics(pts_ref_xy, pts_mov_xy, tform: AffineTransform):
     """
-    Returns errors in pixel units on the reference (fixed) grid.
-    rmse is radial; CE90 ≈ 2.146 * (rmse / sqrt(2))
+    Errors in pixel units on the reference grid.
+    CE90 ≈ 2.146 * (RMSE / sqrt(2))
     """
     if len(pts_ref_xy) == 0:
         return {"num_matches": 0, "rmse_x": None, "rmse_y": None, "rmse": None, "median_err": None, "ce90": None}
@@ -324,7 +313,7 @@ def residual_metrics(pts_ref_xy, pts_mov_xy, tform: AffineTransform):
     dxdy = pts_ref_xy - pts_mov_warp
     rmse_x = float(np.sqrt(np.mean(dxdy[:, 0] ** 2)))
     rmse_y = float(np.sqrt(np.mean(dxdy[:, 1] ** 2)))
-    rmse = float(np.sqrt(np.mean(np.sum(dxdy ** 2, axis=1))))  # radial RMSE
+    rmse = float(np.sqrt(np.mean(np.sum(dxdy ** 2, axis=1))))
     d = np.linalg.norm(dxdy, axis=1)
     sigma_R = rmse / np.sqrt(2.0 + 1e-12)
     ce90 = float(2.146 * sigma_R)
@@ -363,16 +352,15 @@ def main(sar_path, msi_path, out_dir,
          tile: int = 64,
          s1_preproc: bool = False,
          s1_pol: str = "VV",
-         s1_dem: str = "COPERNICUS_30m",
+         s1_dem: str = "Copernicus 30m Global DEM",
          s2_convert: bool = False):
 
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Optional pre-proc: Sentinel-1 (.SAFE or measurement tiff) -> sigma0 TC GeoTIFF
+    # ---- Optional S1 preprocess (pyroSAR + SNAP)
     sar_input = Path(sar_path)
     if s1_preproc:
         if target_crs is None:
-            # default; override via --utm
             target_crs = "EPSG:32651"
         sar_geo = s1_preprocess_with_pyrosar(
             safe_or_meas=str(sar_input),
@@ -380,9 +368,9 @@ def main(sar_path, msi_path, out_dir,
             target_epsg=target_crs,
             target_res_m=target_res,
             pol=s1_pol,
-            dem_type=s1_dem
+            dem_name=s1_dem
         )
-        sar_path = str(sar_geo)  # replace input with produced GeoTIFF
+        sar_path = str(sar_geo)
 
     # ---- Optional convert: Sentinel-2 JP2 -> GeoTIFF
     if s2_convert and msi_path.lower().endswith(".jp2"):
@@ -390,15 +378,16 @@ def main(sar_path, msi_path, out_dir,
         msi_geo = gdal_translate_jp2_to_tif(msi_path, msi_tif)
         msi_path = str(msi_geo)
 
-    # Load rasters (now both should be GeoTIFFs)
+    # Load rasters (both should be GeoTIFFs now)
     sar = load_single_band(sar_path)
     msi = load_single_band(msi_path)
 
     # ---- Determine target CRS (UTM)
     if target_crs is None:
-        with rio.open(sar_path) as _ds: s1 = dataset_bounds_in_wgs84(_ds)
-        with rio.open(msi_path) as _ds: s2 = dataset_bounds_in_wgs84(_ds)
-        inter = (max(s1[0], s2[0]), max(s1[1], s2[1]), min(s1[2], s2[2]), min(s1[3], s2[3]))
+        with rio.open(sar_path) as _ds: s1_bounds = dataset_bounds_in_wgs84(_ds)
+        with rio.open(msi_path) as _ds: s2_bounds = dataset_bounds_in_wgs84(_ds)
+        inter = (max(s1_bounds[0], s2_bounds[0]), max(s1_bounds[1], s2_bounds[1]),
+                 min(s1_bounds[2], s2_bounds[2]), min(s1_bounds[3], s2_bounds[3]))
         lon_c = 0.5 * (inter[0] + inter[2]); lat_c = 0.5 * (inter[1] + inter[3])
         target_crs = utm_epsg_from_lonlat(lon_c, lat_c)
     dst_crs = rio.crs.CRS.from_string(target_crs)
@@ -469,7 +458,7 @@ def main(sar_path, msi_path, out_dir,
     save_overlay(out_dir / "fine_overlay.png", sar_chip.data, msi_refined)
     save_checkerboard(out_dir / "fine_checker.png", sar_chip.data, msi_refined, tile=tile)
 
-    # ---- Export GeoTIFFs (float32 with proper float predictor)
+    # ---- Export GeoTIFFs (float32 with float predictor)
     out_profile = sar_chip.profile.copy()
     out_profile.update({"compress": "deflate", "predictor": 3, "tiled": True})
     with rio.open(out_dir / "msi_coreg_to_sar.tif", "w", **out_profile) as dst:
@@ -518,11 +507,11 @@ if __name__ == "__main__":
     ap.add_argument("--utm", default=None, help="Target CRS (e.g., EPSG:32651). Auto if omitted.")
     ap.add_argument("--levels", type=int, default=3, help="Pyramid levels for NGF refinement")
     ap.add_argument("--tile", type=int, default=64, help="Checkerboard tile size (pixels)")
-    # New flags
     ap.add_argument("--s1_preproc", action="store_true",
                     help="Use pyroSAR+SNAP to geocode S1 input to sigma0 terrain-corrected GeoTIFF")
     ap.add_argument("--s1_pol", default="VV", choices=["VV", "VH"], help="S1 polarization for preprocessing")
-    ap.add_argument("--s1_dem", default="COPERNICUS_30m", help="DEM name for SNAP (e.g., COPERNICUS_30m, SRTM 3Sec)")
+    ap.add_argument("--s1_dem", default="Copernicus 30m Global DEM",
+                    help="DEM name for SNAP (e.g., 'Copernicus 30m Global DEM', 'SRTM 3Sec')")
     ap.add_argument("--s2_convert", action="store_true",
                     help="Convert S2 JP2 to GeoTIFF via GDAL before processing")
     args = ap.parse_args()
