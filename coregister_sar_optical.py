@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Cross-Modality Co-registration (SAR ↔ Optical) — NGF + affine refinement
+With visible progress updates (prints + tqdm).
 
 Supports RAW inputs:
 - Sentinel-1: .SAFE OR measurement/*vv*.tiff -> (optional) pyroSAR+SNAP geocode to sigma0, terrain-corrected GeoTIFF
@@ -9,7 +10,7 @@ Supports RAW inputs:
 Pipeline:
 1) (Optional) S1 preproc with pyroSAR (Calibration -> Terrain Correction) to UTM.
 2) (Optional) S2 JP2 -> GeoTIFF via gdal_translate.
-3) Coarse alignment: reproject SAR & MSI to a *shared* UTM grid.
+3) Coarse alignment: reproject SAR & MSI to a shared UTM grid.
 4) Fine alignment: NGF-based affine refinement (Huber loss) in a pyramid.
 5) QC: RMSE_x, RMSE_y, radial RMSE, median error, CE90; checkerboard overlays.
 6) Outputs: co-registered chip(s), transform params, QC summary.
@@ -36,52 +37,57 @@ from skimage.feature import ORB, match_descriptors
 from skimage.filters import sobel_h, sobel_v, gaussian
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 
 # ----------------------------
-# S1 preprocessing via pyroSAR (SNAP gpt backend)
+# Sentinel-1 preprocessing with pyroSAR+SNAP
 # ----------------------------
 def s1_preprocess_with_pyrosar(safe_or_meas: str,
                                out_dir: Path,
                                target_epsg: str,
                                target_res_m: float = 10.0,
                                pol: str = "VV",
-                               dem_name: str = "Copernicus 30m Global DEM") -> Path:
+                               dem_type: str = "Copernicus 30m Global DEM") -> Path:
     """
-    Use pyroSAR to run SNAP 'geocode' (Calibration -> Terrain Correction).
-    Returns the path to the produced GeoTIFF (sigma0, terrain-corrected).
+    Use pyroSAR to call SNAP 'geocode' (Calibration -> Terrain Correction).
+    Returns path to the produced GeoTIFF (sigma0, terrain-corrected).
     """
     try:
         from pyroSAR.snap import geocode
     except Exception as e:
         raise RuntimeError(
-            "pyroSAR not importable. Ensure 'pyroSAR' & 'spatialist' are installed and GDAL Python works."
+            "pyroSAR not available. Ensure GDAL works and SNAP 'gpt' is on PATH."
         ) from e
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # pyroSAR 0.30.1 signature: spacing, t_srs, polarizations, refarea, scaling, demName, export_extra
+    print("[S1] Starting pyroSAR geocode (Calibration + Terrain Correction)…")
     geocode(
         infile=str(safe_or_meas),
         outdir=str(out_dir),
-        spacing=target_res_m,          # pixel spacing [m]
-        t_srs=target_epsg,             # e.g., "EPSG:32651"
-        polarizations=[pol],           # e.g., ["VV"] or ["VH"]
-        refarea="sigma0",              # output reference area
-        scaling="linear",              # "linear" or "dB"
-        demName=dem_name,              # SNAP DEM name, e.g., "Copernicus 30m Global DEM"
-        export_extra=["localIncidenceAngle"],
+        spacing=target_res_m,             # pixel spacing
+        t_srs=target_epsg,                # CRS (e.g., EPSG:32651)
+        polarizations=[pol],              # ["VV"] or ["VH"]
+        refarea='sigma0',
+        scaling='linear',                 # or 'dB'
+        demName=dem_type,                 # SNAP DEM identifier
+        export_extra=['localIncidenceAngle']
     )
+    print("[S1] pyroSAR geocode finished.")
 
-    # Find newest GeoTIFF written by geocode()
+    # Find the produced GeoTIFF
     cands = sorted(out_dir.glob("*.tif")) + sorted(out_dir.glob("*.tiff"))
     if not cands:
-        raise RuntimeError("pyroSAR geocode finished but no GeoTIFF found in output directory.")
-    return max(cands, key=lambda p: p.stat().st_mtime)
+        raise RuntimeError("pyroSAR geocode completed but no GeoTIFF found in output directory.")
+    tif_path = max(cands, key=lambda p: p.stat().st_mtime)
+    return tif_path
 
 
 def gdal_translate_jp2_to_tif(jp2_path: str, out_tif: Path) -> Path:
-    """Convert Sentinel-2 JP2 (B08_10m.jp2) to GeoTIFF using gdal_translate."""
+    """
+    Convert Sentinel-2 JP2 (B08_10m.jp2) to GeoTIFF using gdal_translate.
+    """
     out_tif.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "gdal_translate",
@@ -93,7 +99,9 @@ def gdal_translate_jp2_to_tif(jp2_path: str, out_tif: Path) -> Path:
         jp2_path,
         str(out_tif)
     ]
+    print(f"[S2] Converting JP2 -> GeoTIFF: {jp2_path}")
     subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print("[S2] Conversion finished:", out_tif)
     return out_tif
 
 
@@ -146,7 +154,7 @@ def snap_bounds(bounds: Tuple[float, float, float, float], res: float) -> Tuple[
 
 
 # ----------------------------
-# IO & Reprojection (Coarse)
+# IO & Reprojection
 # ----------------------------
 @dataclass
 class GeoImage:
@@ -262,7 +270,7 @@ def refine_affine_ngf(fix_img: np.ndarray, mov_img: np.ndarray, levels: int = 3,
     fix_pyr, mov_pyr = build_pyr(fix), build_pyr(mov)
 
     p = np.array(init_params, dtype=np.float64)
-    for lvl, (f, m) in enumerate(zip(fix_pyr, mov_pyr), 1):
+    for lvl, (f, m) in enumerate(tqdm(list(zip(fix_pyr, mov_pyr)), desc="[NGF] Pyramid levels"), 1):
         fix_ngf = compute_ngf(f, eps=1e-3, sigma=1.0)
         out_shape = f.shape
         huber_delta = 0.08 / (2 ** (levels - lvl))
@@ -273,40 +281,25 @@ def refine_affine_ngf(fix_img: np.ndarray, mov_img: np.ndarray, levels: int = 3,
 
 
 # ----------------------------
-# QC helpers
+# QC + Visualization
 # ----------------------------
-def orb_matches_xy(imgA: np.ndarray, imgB: np.ndarray, n_keypoints=2000, seed: int = 0):
-    """
-    Feature matching for QC (on gradient magnitudes). Returns (xy_ref, xy_mov).
-    Deterministic via random_state.
-    """
+def orb_matches_xy(imgA: np.ndarray, imgB: np.ndarray, n_keypoints=2000):
     def gradmag(im):
         gx = sobel_h(im); gy = sobel_v(im); return np.hypot(gx, gy)
-
     A = to_float32_minmax(imgA); B = to_float32_minmax(imgB)
     Ag = to_float32_minmax(gradmag(A)); Bg = to_float32_minmax(gradmag(B))
-
-    orbA = ORB(n_keypoints=n_keypoints, fast_threshold=0.05, random_state=seed)
-    orbA.detect_and_extract(Ag)
-    kA, dA = orbA.keypoints, orbA.descriptors
-
-    orbB = ORB(n_keypoints=n_keypoints, fast_threshold=0.05, random_state=seed)
-    orbB.detect_and_extract(Bg)
-    kB, dB = orbB.keypoints, orbB.descriptors
-
+    orb = ORB(n_keypoints=n_keypoints, fast_threshold=0.05); orb.detect_and_extract(Ag)
+    kA, dA = orb.keypoints, orb.descriptors
+    orb = ORB(n_keypoints=n_keypoints, fast_threshold=0.05); orb.detect_and_extract(Bg)
+    kB, dB = orb.keypoints, orb.descriptors
     if dA is None or dB is None or len(dA) == 0 or len(dB) == 0:
         return np.zeros((0, 2)), np.zeros((0, 2))
     matches = match_descriptors(dA, dB, cross_check=True)
-    ptsA = kA[matches[:, 0]][:, ::-1]  # (row,col)->(x,y)
-    ptsB = kB[matches[:, 1]][:, ::-1]
+    ptsA = kA[matches[:, 0]][:, ::-1]; ptsB = kB[matches[:, 1]][:, ::-1]
     return ptsA.astype(np.float32), ptsB.astype(np.float32)
 
 
 def residual_metrics(pts_ref_xy, pts_mov_xy, tform: AffineTransform):
-    """
-    Errors in pixel units on the reference grid.
-    CE90 ≈ 2.146 * (RMSE / sqrt(2))
-    """
     if len(pts_ref_xy) == 0:
         return {"num_matches": 0, "rmse_x": None, "rmse_y": None, "rmse": None, "median_err": None, "ce90": None}
     pts_mov_warp = tform(pts_mov_xy)
@@ -321,9 +314,6 @@ def residual_metrics(pts_ref_xy, pts_mov_xy, tform: AffineTransform):
             "median_err": float(np.median(d)), "ce90": ce90}
 
 
-# ----------------------------
-# Visualization
-# ----------------------------
 def save_checkerboard(path, imgA, imgB, tile=64):
     A = to_float32_minmax(imgA); B = to_float32_minmax(imgB)
     H, W = A.shape; out = np.zeros((H, W), dtype=np.float32)
@@ -357,32 +347,39 @@ def main(sar_path, msi_path, out_dir,
 
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Optional S1 preprocess (pyroSAR + SNAP)
-    sar_input = Path(sar_path)
+    print("[Pipeline] Starting…")
+
+    # S1 preprocess
     if s1_preproc:
+        print("[Pipeline] Running Sentinel-1 preprocessing…")
         if target_crs is None:
             target_crs = "EPSG:32651"
+            print(f"[Pipeline] No CRS provided; defaulting to {target_crs}")
         sar_geo = s1_preprocess_with_pyrosar(
-            safe_or_meas=str(sar_input),
+            safe_or_meas=str(sar_path),
             out_dir=out_dir / "s1_preproc",
             target_epsg=target_crs,
             target_res_m=target_res,
             pol=s1_pol,
-            dem_name=s1_dem
+            dem_type=s1_dem
         )
         sar_path = str(sar_geo)
+        print("[Pipeline] S1 preprocessing done ->", sar_path)
 
-    # ---- Optional convert: Sentinel-2 JP2 -> GeoTIFF
+    # S2 convert
     if s2_convert and msi_path.lower().endswith(".jp2"):
+        print("[Pipeline] Running Sentinel-2 conversion…")
         msi_tif = out_dir / "s2_B08_10m.tif"
         msi_geo = gdal_translate_jp2_to_tif(msi_path, msi_tif)
         msi_path = str(msi_geo)
+        print("[Pipeline] S2 conversion done ->", msi_path)
 
-    # Load rasters (both should be GeoTIFFs now)
+    # Load rasters
+    print("[Pipeline] Loading SAR + MSI rasters…")
     sar = load_single_band(sar_path)
     msi = load_single_band(msi_path)
 
-    # ---- Determine target CRS (UTM)
+    # Determine target CRS if still None
     if target_crs is None:
         with rio.open(sar_path) as _ds: s1_bounds = dataset_bounds_in_wgs84(_ds)
         with rio.open(msi_path) as _ds: s2_bounds = dataset_bounds_in_wgs84(_ds)
@@ -390,32 +387,33 @@ def main(sar_path, msi_path, out_dir,
                  min(s1_bounds[2], s2_bounds[2]), min(s1_bounds[3], s2_bounds[3]))
         lon_c = 0.5 * (inter[0] + inter[2]); lat_c = 0.5 * (inter[1] + inter[3])
         target_crs = utm_epsg_from_lonlat(lon_c, lat_c)
+        print(f"[Pipeline] Auto-selected UTM: {target_crs}")
     dst_crs = rio.crs.CRS.from_string(target_crs)
 
-    # ---- Optional AOI polygon (assumed WGS84); transform to dst_crs if provided
+    # AOI (optional)
     aoi_poly = None
     if aoi_geojson:
+        print("[Pipeline] Loading AOI…")
         from pyproj import Transformer
         aoi_ll = read_geojson_polygon(aoi_geojson)
         tr = Transformer.from_crs("EPSG:4326", dst_crs, always_xy=True).transform
         aoi_poly = shp_transform(tr, aoi_ll)
+        print("[Pipeline] AOI loaded.")
 
-    # ---- Compute shared, snapped grid bounds (in dst_crs) BEFORE raster reprojection
+    # Compute shared, snapped grid in dst_crs
+    print("[Pipeline] Computing shared grid bounds…")
     from pyproj import Transformer
-    # SAR bounds -> dst_crs
     with rio.open(sar_path) as ds:
         sleft, sbot, sright, stop = rio.transform.array_bounds(ds.height, ds.width, ds.transform)
         tr_sar = Transformer.from_crs(ds.crs, dst_crs, always_xy=True).transform
         x1, y1 = tr_sar(sleft, sbot); x2, y2 = tr_sar(sright, stop)
         sar_bounds_dst = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
-    # MSI bounds -> dst_crs
     with rio.open(msi_path) as ds:
         mleft, mbot, mright, mtop = rio.transform.array_bounds(ds.height, ds.width, ds.transform)
         tr_msi = Transformer.from_crs(ds.crs, dst_crs, always_xy=True).transform
         u1, v1 = tr_msi(mleft, mbot); u2, v2 = tr_msi(mright, mtop)
         msi_bounds_dst = (min(u1, u2), min(v1, v2), max(u1, u2), max(v1, v2))
 
-    # Intersection (and apply AOI if given), then snap to pixel grid
     inter_bounds = (
         max(sar_bounds_dst[0], msi_bounds_dst[0]),
         max(sar_bounds_dst[1], msi_bounds_dst[1]),
@@ -424,7 +422,6 @@ def main(sar_path, msi_path, out_dir,
     )
     if inter_bounds[2] <= inter_bounds[0] or inter_bounds[3] <= inter_bounds[1]:
         raise RuntimeError("No spatial overlap between SAR and MSI in target CRS.")
-
     if aoi_poly is not None:
         inter_poly = box(*inter_bounds).intersection(aoi_poly)
         if inter_poly.is_empty:
@@ -432,33 +429,41 @@ def main(sar_path, msi_path, out_dir,
         inter_bounds = inter_poly.bounds
 
     grid_bounds = snap_bounds(inter_bounds, target_res)
-    if (grid_bounds[2] - grid_bounds[0]) <= 0 or (grid_bounds[3] - grid_bounds[1]) <= 0:
-        raise RuntimeError("Snapped grid bounds collapsed (check AOI size vs. resolution).")
+    print(f"[Pipeline] Grid bounds: {grid_bounds}")
 
-    # ---- Coarse alignment: reproject both to the SAME grid
+    # Coarse reprojection to same grid
+    print("[Pipeline] Reprojecting to common grid…")
     sar_chip = reproject_to_common_grid(sar, dst_crs=dst_crs, res=target_res, dst_bounds=grid_bounds)
     msi_chip = reproject_to_common_grid(msi, dst_crs=dst_crs, res=target_res, dst_bounds=grid_bounds)
 
-    # ---- Save coarse overlays
+    # Coarse overlays
+    print("[Pipeline] Saving coarse overlays…")
+    out_dir.mkdir(parents=True, exist_ok=True)
     save_overlay(out_dir / "coarse_overlay.png", sar_chip.data, msi_chip.data)
     save_checkerboard(out_dir / "coarse_checker.png", sar_chip.data, msi_chip.data, tile=tile)
 
-    # ---- Fine: NGF affine refinement (warp MSI -> SAR grid)
+    # Fine refinement
+    print("[Pipeline] Running NGF affine refinement…")
     init = (0, 0, 0, 1, 1, 0)  # tx, ty, rot_deg, sx, sy, shear_rad
     params, tform = refine_affine_ngf(fix_img=sar_chip.data, mov_img=msi_chip.data, levels=levels, init_params=init)
     msi_refined = warp_image(msi_chip.data, tform, output_shape=sar_chip.data.shape, order=1)
+    print("[Pipeline] NGF refinement done.")
 
-    # ---- QC: residuals (simple ORB-on-gradient surrogate)
-    refA, movA = orb_matches_xy(sar_chip.data, msi_chip.data, seed=0)
+    # QC
+    print("[Pipeline] Computing QC metrics…")
+    refA, movA = orb_matches_xy(sar_chip.data, msi_chip.data)
     qc_before = residual_metrics(refA, movA, AffineTransform())
-    refB, movB = orb_matches_xy(sar_chip.data, msi_refined, seed=0)
+    refB, movB = orb_matches_xy(sar_chip.data, msi_refined)
     qc_after = residual_metrics(refB, movB, AffineTransform())
+    print("[Pipeline] QC metrics computed.")
 
-    # ---- Save fine overlays
+    # Fine overlays
+    print("[Pipeline] Saving fine overlays…")
     save_overlay(out_dir / "fine_overlay.png", sar_chip.data, msi_refined)
     save_checkerboard(out_dir / "fine_checker.png", sar_chip.data, msi_refined, tile=tile)
 
-    # ---- Export GeoTIFFs (float32 with float predictor)
+    # Export GeoTIFFs
+    print("[Pipeline] Writing outputs…")
     out_profile = sar_chip.profile.copy()
     out_profile.update({"compress": "deflate", "predictor": 3, "tiled": True})
     with rio.open(out_dir / "msi_coreg_to_sar.tif", "w", **out_profile) as dst:
@@ -466,7 +471,7 @@ def main(sar_path, msi_path, out_dir,
     with rio.open(out_dir / "sar_chip.tif", "w", **out_profile) as dst:
         dst.write(sar_chip.data.astype(np.float32), 1)
 
-    # ---- Params & QC JSON
+    # Params & QC JSON
     tdict = {
         "tx_px": float(params[0]),
         "ty_px": float(params[1]),
@@ -489,6 +494,7 @@ def main(sar_path, msi_path, out_dir,
     with open(out_dir / "qc_summary.json", "w") as f:
         json.dump({"before": qc_before, "after": qc_after, "thresholds": thresholds, "accepted": accepted}, f, indent=2)
 
+    print("[Pipeline] Done.")
     print("Affine params:", tdict)
     print("QC before:", qc_before)
     print("QC after :", qc_after)
